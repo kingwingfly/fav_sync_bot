@@ -22,7 +22,7 @@ fn init() -> Result<()> {
         .filter_level(log::LevelFilter::Info)
         .init();
     info!("Initializing..");
-    dotenv::dotenv().context("Failed to load env vars")?;
+    dotenv::dotenv().ok();
     info!(
         "TELOXIDE_TOKEN: {}",
         std::env::var("TELOXIDE_TOKEN").context("TELOXIDE_TOKEN unset")?
