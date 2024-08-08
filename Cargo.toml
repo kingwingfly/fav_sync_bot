@@ -1,0 +1,20 @@
+[workspace]
+members = ["bot"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Louis <836250617@qq.com>"]
+description = "A telegram bot to sync files to local server."
+license = "MIT"
+
+[workspace.dependencies]
+
+
+[profile.release]
+lto = "fat"
+opt-level = 3
+codegen-units = 1
+strip = "debuginfo"
+panic = "abort"
