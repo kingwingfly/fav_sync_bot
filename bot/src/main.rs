@@ -1,14 +1,16 @@
 use anyhow::{Context, Result};
 use log::{debug, error, info};
 use teloxide::{
-    net::Download,
-    payloads::GetUpdatesSetters,
-    prelude::Requester,
-    types::{AllowedUpdate, MediaKind, MessageKind, Update, UpdateKind},
-    Bot,
+    dispatching::{
+        dialogue::{self, InMemStorage},
+        UpdateHandler,
+    },
+    macros::BotCommands,
+    payloads::GetFile,
+    prelude::*,
+    types::{MediaKind, MessageKind},
+    utils::command::BotCommands as _,
 };
-use tokio::fs::File;
-use tokio_util::sync::CancellationToken;
 
 #[tokio::main]
 async fn main() {
@@ -19,7 +21,7 @@ async fn main() {
 
 fn init() -> Result<()> {
     pretty_env_logger::env_logger::builder()
-        .filter_level(log::LevelFilter::Info)
+        .filter_level(log::LevelFilter::Debug)
         .init();
     info!("Initializing..");
     dotenv::dotenv().ok();
@@ -37,75 +39,130 @@ fn init() -> Result<()> {
 
 async fn run() -> Result<()> {
     init()?;
-    let owner = std::env::var("OWNER_ID")
-        .unwrap()
-        .parse()
-        .context("INVALID OWNER_ID")?;
+
     let bot = Bot::from_env();
-    let cancel = CancellationToken::new();
-    loop {
-        tokio::select! {
-            _ = async {
-                let updates = bot.get_updates().allowed_updates([AllowedUpdate::Message]).await?;
-                tokio::spawn(handle_updates(bot.clone(), updates, owner, cancel.clone()));
-                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-                Result::<()>::Ok(())
-            } => {}
-            _ = tokio::signal::ctrl_c() => {
-                info!("Exiting..");
-                cancel.cancel();
-                break;
-            }
-        }
-    }
+    Dispatcher::builder(bot, handler())
+        .dependencies(dptree::deps![
+            InMemStorage::<State>::new(),
+            UserId(
+                std::env::var("OWNER_ID")
+                    .unwrap()
+                    .parse()
+                    .context("INVALID OWNER_ID")
+                    .unwrap(),
+            )
+        ])
+        .enable_ctrlc_handler()
+        .build()
+        .dispatch()
+        .await;
     Ok(())
 }
 
-/// This will filter out updates from a specific user and spawn a new task to handle the update.
-async fn handle_updates(
-    bot: Bot,
-    updates: impl IntoIterator<Item = Update>,
-    owner: u64,
-    cancel: CancellationToken,
-) -> Result<()> {
-    for update in updates.into_iter() {
-        if let Some(true) = update.user().map(|user| user.id.0 == owner) {
-            tokio::spawn(handle_update(bot.clone(), update, cancel.clone()));
-        }
-    }
-    Ok(())
+#[derive(Clone, Default, Debug)]
+pub enum State {
+    #[default]
+    Paused,
+    Working,
 }
 
-async fn handle_update(bot: Bot, update: Update, cancel: CancellationToken) -> Result<()> {
-    if let UpdateKind::Message(msg) = update.kind {
-        if let MessageKind::Common(msg) = msg.kind {
-            let media = msg.media_kind;
-            debug!("Get Msg: {}", serde_json::to_string_pretty(&media)?);
-            if let Err(e) = handle_media(bot, media, cancel).await {
-                error!("Error Handling Media: {:?}", e);
-            }
-        }
-    }
-    Ok(())
+#[derive(BotCommands, Clone)]
+#[command(
+    rename_rule = "lowercase",
+    description = "These commands are supported:"
+)]
+enum Command {
+    #[command(description = "display this text.")]
+    Help,
+    #[command(description = "show the current state.")]
+    State,
+    #[command(description = "pause the bot.")]
+    Pause,
+    #[command(description = "unpause the bot.")]
+    Unpause,
 }
 
-async fn handle_media(bot: Bot, media: MediaKind, cancel: CancellationToken) -> Result<()> {
-    match media {
-        MediaKind::Animation(_) => {}
-        MediaKind::Audio(_) => {}
-        MediaKind::Photo(_) => {}
-        MediaKind::Text(_) => {}
-        MediaKind::Video(v) => {
-            let file_id = v.video.file.id;
-            info!("{}", file_id);
-            let path = bot.get_file(file_id).await?;
-            // let mut destination = File::create("video.mp4").await?;
-            // bot.download_file(&path.path, &mut destination).await?;
-            info!("Download: {:?}", path);
-        }
-        MediaKind::VideoNote(_) => {}
-        MediaKind::Voice(_) => {}
-        _ => {}
-    }
-    Ok(())
+type MyDialogue = Dialogue<State, InMemStorage<State>>;
+#[derive(Clone, Debug)]
+struct Token(String);
+
+fn handler() -> UpdateHandler<anyhow::Error> {
+    use dptree::case;
+
+    let command_handler = teloxide::filter_command::<Command, _>()
+        .branch(
+            case![Command::Help].endpoint(async |bot: Bot, msg: Message| {
+                bot.send_message(msg.chat.id, Command::descriptions().to_string())
+                    .await?;
+                Ok(())
+            }),
+        )
+        .branch(
+            case![Command::State].endpoint(async |bot: Bot, msg: Message, state: State| {
+                bot.send_message(msg.chat.id, format!("{:?}", state))
+                    .await?;
+                Ok(())
+            }),
+        )
+        .branch(
+            case![State::Paused].branch(case![Command::Unpause].endpoint(
+                async |bot: Bot, dialogue: MyDialogue, msg: Message, owner: UserId| {
+                    if msg.from.map(|user| user.id) != Some(owner) {
+                        bot.send_message(msg.chat.id, "Permission denied: You are not owner")
+                            .await?;
+                        dialogue.exit().await?;
+                    }
+                    dialogue.update(State::Working).await?;
+                    bot.send_message(msg.chat.id, "Working").await?;
+                    Ok(())
+                },
+            )),
+        )
+        .branch(case![State::Working].branch(case![Command::Pause].endpoint(
+            async |bot: Bot, dialogue: MyDialogue, msg: Message| {
+                dialogue.update(State::Paused).await?;
+                bot.send_message(msg.chat.id, "Paused").await?;
+                Ok(())
+            },
+        )));
+
+    let message_handler = Update::filter_message()
+        .branch(command_handler)
+        .branch(
+            case![State::Working].endpoint(async |bot: Bot, msg: Message| {
+                if let MessageKind::Common(msg) = msg.kind {
+                    match msg.media_kind {
+                        MediaKind::Text(text) => {
+                            debug!("Text: {:#?}", text);
+                        }
+                        MediaKind::Video(video) => {
+                            debug!("{:#?}", video.video);
+                            let p = bot.get_file(video.video.file.id).send().await?.path;
+                            let url = format!(
+                                "https://api.telegram.org/file/bot{token}/{p}",
+                                token = bot.token()
+                            );
+                        }
+                        MediaKind::Photo(photo) => {
+                            for meta in photo.photo {
+                                let p = bot.get_file(meta.file.id).send().await?.path;
+                                let url = format!(
+                                    "https://api.telegram.org/file/bot{token}/{p}",
+                                    token = bot.token()
+                                );
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(())
+            }),
+        )
+        .branch(dptree::endpoint(async || Ok(())));
+
+    let callback_query_handler = Update::filter_callback_query();
+
+    dialogue::enter::<Update, InMemStorage<State>, State, _>()
+        .branch(message_handler)
+        .branch(callback_query_handler)
 }

@@ -9,7 +9,11 @@ dotenv = { version = "0.15" }
 # error
 anyhow = { version = "1.0.86" }
 # telegram
-teloxide = { version = "0.12", features = ["macros", "nightly"] }
+teloxide = { version = "0.13", features = [
+    "macros",
+    "nightly",
+    "ctrlc_handler",
+] }
 # tracing
 log = "0.4"
 pretty_env_logger = "0.4"
